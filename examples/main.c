@@ -12,7 +12,6 @@ void draw(tgp_context* ctx, int width, int height) {
     tgp_project(ctx, 0, (float)width, 0, (float)height);
     tgp_set_color(ctx, 1.0, 1.0, 0.5, 1.0);
     tgp_clear(ctx);
-    tgp_draw_filled_triangle(ctx, 16, 16, 32, 32, 16, 32);
 }
 
 int main(void) {
@@ -78,8 +77,8 @@ int main(void) {
     }
 
     // cleanup
-    tgp_destroy_context(&ctx);
-    tgpgl_destroy_context(&tgpgl_ctx);
+    // tgp_destroy_context(&ctx);
+    // tgpgl_destroy_context(&tgpgl_ctx);
     SDL_GL_DeleteContext(glc);
     SDL_DestroyWindow(window);
     SDL_Quit();
