@@ -8,7 +8,7 @@
 #include "tinygp.h"
 #include "tinygp_gl.h"
 
-#define AUDIO
+// #define AUDIO
 #ifdef AUDIO
 uint64_t t = 0;
 
@@ -18,7 +18,7 @@ void audio_callback(void* userdata, uint8_t* stream, int len) {
         stream[i] = ((t >> 1) * (15 & 0x234568a0 >> (t >> 8 & 28)) |
                      t >> 1 >> (t >> 11) ^ t >> 12) +
                     (t >> 4 & t & 24);
-        stream[i] /= 32;
+        stream[i] /= 64;
         t++;
     }
 }
@@ -27,8 +27,17 @@ void audio_callback(void* userdata, uint8_t* stream, int len) {
 void draw(tgp_context* ctx, int width, int height) {
     tgp_begin(ctx, width, height);
     tgp_project(ctx, 0, (float)width, 0, (float)height);
-    tgp_set_color(ctx, 1.0, 1.0, 0.5, 1.0);
+    tgp_set_color(ctx, 0.2, 0.2, 0.2, 1.0);
     tgp_clear(ctx);
+
+    tgp_vec2 points[3] = {
+        {256, 128},
+        {128, 256},
+        {512, 350}
+    };
+    tgp_set_color(ctx, 1.0, 1.0, 1.0, 1.0);
+    // ctx->antialiasing = false;
+    tgp_draw_convex_polygon(ctx, (const tgp_vec2*)&points, 3);
 }
 
 int main(void) {
