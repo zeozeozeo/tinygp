@@ -20,7 +20,6 @@
 #ifndef TINYGP_H_INCLUDED
 #define TINYGP_H_INCLUDED
 
-#include <bits/stdint-uintn.h>
 #include <float.h>
 #include <math.h>
 #include <stdbool.h>
