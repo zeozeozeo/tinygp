@@ -25,7 +25,7 @@ typedef struct {
     tgp_context* tgpctx;
     GLuint       gl_version;
     char         glsl_version_str[TGPGL_GLSL_VERSION_STR_SIZE];
-    GLuint       vbo;
+    GLuint       vbo, elements;
     GLuint       shader_handle;
 
     GLint  attrib_location_tex;
@@ -160,6 +160,7 @@ static void tgpgl_create_device_objects(tgpgl_context* ctx) {
 
     // create buffers
     glGenBuffers(1, &ctx->vbo);
+    glGenBuffers(1, &ctx->elements);
 
     // create a white texture
     uint8_t data[4 * 4 * 4];
@@ -177,6 +178,7 @@ static void tgpgl_create_device_objects(tgpgl_context* ctx) {
 
 static inline void tgpgl_destroy_device_objects(tgpgl_context* ctx) {
     glDeleteBuffers(1, &ctx->vbo);
+    glDeleteBuffers(1, &ctx->elements);
     glDeleteProgram(ctx->shader_handle);
     glDeleteTextures(1, &ctx->white_texture);
 }
@@ -246,8 +248,9 @@ static void tgpgl_setup_render_state(tgpgl_context* ctx) {
     glUseProgram(ctx->shader_handle);
     glUniform1i(ctx->attrib_location_tex, 0);
 
-    // bind vertex buffer
+    // bind vertex and index buffers
     glBindBuffer(GL_ARRAY_BUFFER, ctx->vbo);
+    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, ctx->elements);
 
     // setup attributes for tgp_vertex
     glEnableVertexAttribArray(ctx->attrib_location_vtx_pos);
@@ -262,9 +265,6 @@ static void tgpgl_setup_render_state(tgpgl_context* ctx) {
     glVertexAttribPointer(ctx->attrib_location_vtx_color, 4, GL_FLOAT, GL_FALSE,
                           sizeof(tgp_vertex),
                           (GLvoid*)TGPGL_OFFSETOF(tgp_vertex, color));
-
-    // TODO
-    glBindTexture(GL_TEXTURE_2D, ctx->white_texture);
 }
 
 TGPDEF void tgpgl_render(tgpgl_context* ctx) {
@@ -277,9 +277,15 @@ TGPDEF void tgpgl_render(tgpgl_context* ctx) {
     // render draw commands
     uint32_t    i = 0;
     tgp_command cmd;
+    int         num_drawcalls = 0;
 
     while (tgp_get_command_p(tgpctx, &cmd, i++)) {
         switch (cmd.type) {
+        case TGP_COMMAND_CLEAR:
+            glClearColor(cmd.data.clear.r, cmd.data.clear.g, cmd.data.clear.b,
+                         cmd.data.clear.a);
+            glClear(GL_COLOR_BUFFER_BIT);
+            break;
         case TGP_COMMAND_VIEWPORT:
             glViewport(cmd.data.viewport.x, cmd.data.viewport.y,
                        cmd.data.viewport.w, cmd.data.viewport.h);
@@ -290,14 +296,28 @@ TGPDEF void tgpgl_render(tgpgl_context* ctx) {
             break;
         case TGP_COMMAND_DRAW: {
             tgp_draw_command draw = cmd.data.draw;
+            printf("drawcall %d: ", ++num_drawcalls);
 
-            // upload vertices
+            // upload vertex/index buffers
             GLsizeiptr vtxbuf_size = sizeof(tgp_vertex) * draw.num_vertices;
+            GLsizeiptr idxbuf_size = sizeof(tgp_index) * draw.num_indices;
+
             glBufferData(GL_ARRAY_BUFFER, vtxbuf_size,
-                         &tgpctx->vertices[draw.vertex_idx], GL_STREAM_DRAW);
+                         &tgpctx->vertices[draw.vtx_offset], GL_STREAM_DRAW);
+            glBufferData(GL_ELEMENT_ARRAY_BUFFER, idxbuf_size,
+                         &tgpctx->indices[draw.idx_offset], GL_STREAM_DRAW);
+
+            for (int i = 0; i < draw.num_indices; i++) {
+                printf("%d ", tgpctx->indices[draw.idx_offset + i]);
+            }
+            printf("\n");
 
             // draw
-            glDrawArrays(GL_TRIANGLES, 0, draw.num_vertices);
+            glBindTexture(GL_TEXTURE_2D, ctx->white_texture);
+            glDrawElements(
+                GL_TRIANGLES, draw.num_indices,
+                sizeof(tgp_index) == 2 ? GL_UNSIGNED_SHORT : GL_UNSIGNED_INT,
+                (void*)(intptr_t)(draw.idx_offset * sizeof(tgp_index)));
             break;
         }
         case TGP_COMMAND_NONE: break;

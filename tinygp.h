@@ -113,16 +113,23 @@ typedef struct {
     tgp_color color;
 } tgp_vertex;
 
+#ifndef tgp_index
+typedef uint16_t tgp_index;
+#endif
+
 typedef enum {
     TGP_COMMAND_NONE = 0,
     TGP_COMMAND_VIEWPORT,
     TGP_COMMAND_SCISSOR,
     TGP_COMMAND_DRAW,
+    TGP_COMMAND_CLEAR,
 } tgp_command_type;
 
 typedef struct {
-    uint32_t   vertex_idx;
+    uint32_t   vtx_offset;
+    uint32_t   idx_offset;
     uint32_t   num_vertices;
+    uint32_t   num_indices;
     tgp_region region;
 } tgp_draw_command;
 
@@ -132,6 +139,7 @@ typedef struct {
         tgp_irect        viewport;
         tgp_irect        scissor;
         tgp_draw_command draw;
+        tgp_color        clear;
     } data;
 
 #ifdef TINYGP_USERDATA_TYPE
@@ -141,6 +149,7 @@ typedef struct {
 
 typedef struct {
     uint32_t max_vertices;
+    uint32_t max_indices;
     uint32_t max_path;
     uint32_t max_commands;
     bool     antialiasing;
@@ -152,8 +161,10 @@ typedef struct {
     tgp_irect viewport;
     tgp_irect scissor;
 
-    uint32_t     max_vertices, cur_vertex;
+    uint32_t     max_vertices, cur_vertex, cur_cmd_vertex;
     tgp_vertex*  vertices;
+    uint32_t     max_indices, cur_index, cur_cmd_index;
+    tgp_index*   indices;
     uint32_t     max_path, cur_path;
     tgp_vec2*    path;
     uint32_t     max_commands, cur_command;
@@ -219,7 +230,8 @@ static const tgp_mat2x3 tgp_default_transform = {
 TGPDEF tgp_options tgp_default_options() {
     return (tgp_options){
         .max_vertices = 65536,
-        .max_path = 32768,
+        .max_indices = 65536 * 3,
+        .max_path = 16384,
         .max_commands = 16384,
         .antialiasing = true,
         .fringe_scale = 1.0f,
@@ -227,9 +239,10 @@ TGPDEF tgp_options tgp_default_options() {
 }
 
 TGPDEF void tgp_init_context(tgp_context* ctx, tgp_options* opts) {
-    TINYGP_ASSERT(ctx != NULL);
+    TINYGP_ASSERT(ctx != NULL && opts != NULL);
     memset(ctx, 0, sizeof(*ctx));
     ctx->max_vertices = opts->max_vertices;
+    ctx->max_indices = opts->max_indices;
     ctx->max_path = opts->max_path;
     ctx->max_commands = opts->max_commands;
     ctx->antialiasing = opts->antialiasing;
@@ -237,10 +250,11 @@ TGPDEF void tgp_init_context(tgp_context* ctx, tgp_options* opts) {
 
     // allocate buffers
     ctx->vertices = malloc(opts->max_vertices * sizeof(tgp_vertex));
+    ctx->indices = malloc(opts->max_indices * sizeof(tgp_index));
     ctx->path = malloc(opts->max_path * sizeof(tgp_vec2));
     ctx->commands = malloc(opts->max_commands * sizeof(tgp_command));
-    TINYGP_ASSERT(ctx->vertices != NULL && ctx->path != NULL &&
-                  ctx->commands != NULL);
+    TINYGP_ASSERT(ctx->vertices != NULL && ctx->indices != NULL &&
+                  ctx->path != NULL && ctx->commands != NULL);
 
     ctx->transform = tgp_default_transform;
 }
@@ -265,7 +279,7 @@ static inline tgp_mat2x3 tgp_mult_proj_and_transform_matrices(tgp_mat2x3* p,
         {
          {x * t->v[0][0], x * t->v[0][1], x * t->v[0][2] + p->v[0][2]},
          {y * t->v[1][0], y * t->v[1][1], y * t->v[1][2] + p->v[1][2]},
-         }
+         },
     };
 }
 
@@ -379,16 +393,23 @@ TGPDEF void tgp_reset_color(tgp_context* ctx) {
     ctx->color.a = 1.0f;
 }
 
-static inline tgp_vertex* tgp_reserve(tgp_context* ctx, uint32_t vtx_count) {
+static inline bool tgp_reserve(tgp_context* ctx, uint32_t vtx_count,
+                               uint32_t idx_count, tgp_vertex** vtx_write_ptr,
+                               tgp_index** idx_write_ptr) {
     TINYGP_ASSERT(ctx != NULL);
-    if (ctx->cur_vertex + vtx_count > ctx->max_vertices) {
+    if (ctx->cur_vertex + vtx_count > ctx->max_vertices ||
+        ctx->cur_index + idx_count > ctx->max_indices) {
         // TODO: add an error here
-        return NULL;
+        return false;
     }
 
-    tgp_vertex* vtx_write_ptr = &ctx->vertices[ctx->cur_vertex];
+    *vtx_write_ptr = &ctx->vertices[ctx->cur_vertex];
     ctx->cur_vertex += vtx_count;
-    return vtx_write_ptr;
+    ctx->cur_cmd_vertex += vtx_count;
+    *idx_write_ptr = &ctx->indices[ctx->cur_index];
+    ctx->cur_index += idx_count;
+    ctx->cur_cmd_index += idx_count;
+    return true;
 }
 
 static inline tgp_command* tgp_peek_prev_commands(tgp_context* ctx,
@@ -403,6 +424,8 @@ static inline tgp_command* tgp_peek_prev_commands(tgp_context* ctx,
 static inline tgp_command* tgp_next_command(tgp_context* ctx) {
     TINYGP_ASSERT(ctx != NULL);
     if (ctx->cur_command < ctx->max_commands) {
+        ctx->cur_cmd_vertex = 0;
+        ctx->cur_cmd_index = 0;
         return &ctx->commands[ctx->cur_command++];
     }
     // TODO: add an error here
@@ -514,7 +537,11 @@ TGPDEF void tgp_begin(tgp_context* ctx, int width, int height) {
     ctx->color = default_color;
     ctx->cur_command = 0;
     ctx->cur_vertex = 0;
+    ctx->cur_cmd_index = 0;
+    ctx->cur_cmd_vertex = 0;
     ctx->cur_transform = 0;
+    ctx->cur_path = 0;
+    ctx->cur_index = 0;
 
     // push a viewport command
     tgp_viewport(ctx, 0, 0, width, height);
@@ -540,7 +567,8 @@ TGPDEF bool tgp_get_command_p(tgp_context* ctx, tgp_command* cmd,
 }
 
 static bool tgp_merge_command(tgp_context* ctx, tgp_region region,
-                              uint32_t vertex_index, uint32_t num_vertices) {
+                              uint32_t vtx_offset, uint32_t idx_offset,
+                              uint32_t num_vertices, uint32_t num_indices) {
     TINYGP_ASSERT(ctx != NULL);
 #if TGP_BATCH_OPTIMIZER_DEPTH > 0
     tgp_command* prev_cmd = NULL;
@@ -607,25 +635,40 @@ static bool tgp_merge_command(tgp_context* ctx, tgp_region region,
     if (!overlaps_next) {
         // batch the previous command
         if (inter_cmd_count > 0) {
-            if (ctx->cur_vertex + num_vertices > ctx->max_vertices) {
+            if (ctx->cur_vertex + num_vertices > ctx->max_vertices ||
+                ctx->cur_index + num_indices > ctx->max_indices) {
                 // not enough space
+                // TODO: add an error here
                 return false;
             }
 
             // rearrange vertices
-            uint32_t prev_end_vertex = prev_cmd->data.draw.vertex_idx +
-                                       prev_cmd->data.draw.num_vertices;
+            const uint32_t prev_end_vertex = prev_cmd->data.draw.vtx_offset +
+                                             prev_cmd->data.draw.num_vertices;
             uint32_t move_count = ctx->cur_vertex - prev_end_vertex;
 
             memmove(&ctx->vertices[prev_end_vertex + num_vertices],
                     &ctx->vertices[prev_end_vertex],
                     move_count * sizeof(tgp_vertex));
             memcpy(&ctx->vertices[prev_end_vertex],
-                   &ctx->vertices[vertex_index + num_vertices],
+                   &ctx->vertices[vtx_offset + num_vertices],
                    num_vertices * sizeof(tgp_vertex));
 
+            // rearrange indices
+            const uint32_t prev_end_index = prev_cmd->data.draw.idx_offset +
+                                            prev_cmd->data.draw.num_indices;
+            move_count = ctx->cur_index - prev_end_index;
+
+            memmove(&ctx->indices[prev_end_index + num_indices],
+                    &ctx->vertices[prev_end_index],
+                    move_count * sizeof(tgp_index));
+            memcpy(&ctx->indices[prev_end_index],
+                   &ctx->indices[idx_offset + num_indices],
+                   num_indices * sizeof(tgp_index));
+
             for (uint32_t i = 0; i < inter_cmd_count; i++) {
-                inter_cmds[i]->data.draw.vertex_idx += num_vertices;
+                inter_cmds[i]->data.draw.vtx_offset += num_vertices;
+                inter_cmds[i]->data.draw.idx_offset += num_indices;
             }
         }
 
@@ -635,6 +678,7 @@ static bool tgp_merge_command(tgp_context* ctx, tgp_region region,
         prev_region.x2 = TGP_MAX(prev_region.x2, region.x2);
         prev_region.y2 = TGP_MAX(prev_region.y2, region.y2);
         prev_cmd->data.draw.num_vertices += num_vertices;
+        prev_cmd->data.draw.num_indices += num_indices;
         prev_cmd->data.draw.region = prev_region;
     } else {
         // batch the next command
@@ -646,32 +690,47 @@ static bool tgp_merge_command(tgp_context* ctx, tgp_region region,
             return false;
         }
 
-        uint32_t prev_num_vertices = prev_cmd->data.draw.num_vertices;
-        if (ctx->cur_vertex + prev_num_vertices > ctx->max_vertices) {
+        const uint32_t prev_num_vertices = prev_cmd->data.draw.num_vertices;
+        const uint32_t prev_num_indices = prev_cmd->data.draw.num_indices;
+
+        if (ctx->cur_vertex + prev_num_vertices > ctx->max_vertices ||
+            ctx->cur_index + prev_num_indices > ctx->max_indices) {
             // not enough space
+            // TODO: add an error here
             return false;
         }
 
         // rearrange vertices
-        memmove(&ctx->vertices[vertex_index + prev_num_vertices],
-                &ctx->vertices[vertex_index],
-                num_vertices * sizeof(tgp_vertex));
-        memcpy(&ctx->vertices[vertex_index],
-               &ctx->vertices[prev_cmd->data.draw.vertex_idx],
+        memmove(&ctx->vertices[vtx_offset + prev_num_vertices],
+                &ctx->vertices[vtx_offset], num_vertices * sizeof(tgp_vertex));
+        memcpy(&ctx->vertices[vtx_offset],
+               &ctx->vertices[prev_cmd->data.draw.vtx_offset],
                prev_num_vertices * sizeof(tgp_vertex));
+
+        // rearrange indices
+        memmove(&ctx->indices[idx_offset + prev_num_indices],
+                &ctx->indices[idx_offset], num_indices * sizeof(tgp_index));
+        memcpy(&ctx->indices[idx_offset],
+               &ctx->indices[prev_cmd->data.draw.idx_offset],
+               prev_num_indices * sizeof(tgp_index));
 
         // update draw region
         prev_region.x1 = TGP_MIN(prev_region.x1, region.x1);
         prev_region.y1 = TGP_MIN(prev_region.y1, region.y1);
         prev_region.x2 = TGP_MAX(prev_region.x2, region.x2);
         prev_region.y2 = TGP_MAX(prev_region.y2, region.y2);
+
         ctx->cur_vertex += prev_num_vertices;
+        ctx->cur_index += prev_num_indices;
         num_vertices += prev_num_vertices;
+        num_indices += prev_num_indices;
 
         cmd->type = TGP_COMMAND_DRAW;
         cmd->data.draw.region = prev_region;
-        cmd->data.draw.vertex_idx = vertex_index;
+        cmd->data.draw.vtx_offset = vtx_offset;
+        cmd->data.draw.idx_offset = idx_offset;
         cmd->data.draw.num_vertices = num_vertices;
+        cmd->data.draw.num_indices = num_indices;
 #ifdef TINYGP_USERDATA_TYPE
         cmd->userdata = ctx->current_userdata;
 #endif
@@ -681,26 +740,25 @@ static bool tgp_merge_command(tgp_context* ctx, tgp_region region,
     }
     return true;
 #else
-    (void)ctx;
-    (void)region;
-    (void)vertex_index;
-    (void)num_vertices;
     return false;
 #endif // #if TGP_BATCH_OPTIMIZER_DEPTH > 0
 }
 
 static void tgp_queue_draw(tgp_context* ctx, tgp_region region,
-                           uint32_t vertex_index, uint32_t num_vertices) {
+                           uint32_t vtx_offset, uint32_t idx_offset,
+                           uint32_t num_vertices, uint32_t num_indices) {
     TINYGP_ASSERT(ctx != NULL);
     if (region.x1 > 1.0f || region.y1 > 1.0f || region.x2 < -1.0f ||
         region.y2 < -1.0f) {
         // region is outside the screen
         ctx->cur_vertex -= num_vertices;
+        ctx->cur_index -= num_indices;
         return;
     }
 
     // try to merge with previous draw command
-    if (tgp_merge_command(ctx, region, vertex_index, num_vertices)) {
+    if (tgp_merge_command(ctx, region, vtx_offset, idx_offset, num_vertices,
+                          num_indices)) {
         return;
     }
 
@@ -712,8 +770,10 @@ static void tgp_queue_draw(tgp_context* ctx, tgp_region region,
     }
 
     cmd->type = TGP_COMMAND_DRAW;
+    cmd->data.draw.vtx_offset = vtx_offset;
+    cmd->data.draw.idx_offset = idx_offset;
     cmd->data.draw.num_vertices = num_vertices;
-    cmd->data.draw.vertex_idx = vertex_index;
+    cmd->data.draw.num_indices = num_indices;
     cmd->data.draw.region = region;
 #ifdef TINYGP_USERDATA_TYPE
     cmd->userdata = ctx->current_userdata;
@@ -734,54 +794,27 @@ static inline void tgp_transform_vec2(tgp_mat2x3* m, tgp_vec2* to,
 
 TGPDEF void tgp_clear(tgp_context* ctx) {
     TINYGP_ASSERT(ctx != NULL);
-    uint32_t    num_vertices = 6; // 6 vertices to draw a quad
-    uint32_t    vertex_index = ctx->cur_vertex;
-    tgp_vertex* vtx_write_ptr = tgp_reserve(ctx, num_vertices);
-    if (vtx_write_ptr == NULL) {
+    tgp_command* cmd = tgp_next_command(ctx);
+    if (cmd == NULL) {
         return;
     }
-
-    const tgp_vec2 quad[4] = {
-        {-1.0f, -1.0f}, // bottom left
-        {1.0f,  -1.0f}, // bottom right
-        {1.0f,  1.0f }, // top right
-        {-1.0f, 1.0f }, // top left
-    };
-    const tgp_vec2 texcoord = {0.0f, 0.0f};
-    tgp_color      color = ctx->color; // copy to stack for more efficency
-
-    // we won't use tgp_draw_vertices here because we don't care about the
-    // projecton matrix
-    for (int i = 0; i < 4; i++) {
-        vtx_write_ptr[i].position = quad[i];
-        vtx_write_ptr[i].texcoord = texcoord;
-        vtx_write_ptr[i].color = color;
-    }
-
-    vtx_write_ptr[4].position = quad[0];
-    vtx_write_ptr[4].texcoord = texcoord;
-    vtx_write_ptr[4].color = color;
-    vtx_write_ptr[5].position = quad[2];
-    vtx_write_ptr[5].texcoord = texcoord;
-    vtx_write_ptr[5].color = color;
-
-    tgp_region region = {-1.0f, -1.0f, 1.0f, 1.0f};
-    tgp_queue_draw(ctx, region, vertex_index, num_vertices);
+    cmd->type = TGP_COMMAND_CLEAR;
+    cmd->data.clear = ctx->color;
 }
 
-static inline void tgp_queue_draw_transform(tgp_context* ctx,
-                                            uint32_t     vertex_index,
-                                            uint32_t     num_vertices,
-                                            bool         init_texcoord,
-                                            bool         set_color) {
+static inline void
+tgp_queue_draw_transform(tgp_context* ctx, uint32_t vtx_offset,
+                         uint32_t idx_offset, uint32_t num_vertices,
+                         uint32_t num_indices, bool init_texcoord,
+                         bool set_color) {
     TINYGP_ASSERT(ctx != NULL);
-    tgp_mat2x3 mvp = ctx->mvp;
-    tgp_region region = {FLT_MAX, FLT_MAX, -FLT_MAX, -FLT_MAX};
-    tgp_color  color = ctx->color;
+    const tgp_mat2x3 mvp = ctx->mvp;
+    tgp_region       region = {FLT_MAX, FLT_MAX, -FLT_MAX, -FLT_MAX};
+    const tgp_color  color = ctx->color;
 
-    for (uint32_t i = vertex_index; i < vertex_index + num_vertices; i++) {
-        tgp_vertex* vertex = &ctx->vertices[i];
-        tgp_vec2    pos = tgp_mult_mat3_vec2(&mvp, vertex->position);
+    for (uint32_t i = vtx_offset; i < vtx_offset + num_vertices; i++) {
+        tgp_vertex*    vertex = &ctx->vertices[i];
+        const tgp_vec2 pos = tgp_mult_mat3_vec2(&mvp, vertex->position);
         region.x1 = TGP_MIN(region.x1, pos.x);
         region.y1 = TGP_MIN(region.y1, pos.y);
         region.x2 = TGP_MAX(region.x2, pos.x);
@@ -797,7 +830,8 @@ static inline void tgp_queue_draw_transform(tgp_context* ctx,
         }
     }
 
-    tgp_queue_draw(ctx, region, vertex_index, num_vertices);
+    tgp_queue_draw(ctx, region, vtx_offset, idx_offset, num_vertices,
+                   num_indices);
 }
 
 static inline bool tgp_is_transparent(tgp_context* ctx) {
@@ -807,9 +841,13 @@ static inline bool tgp_is_transparent(tgp_context* ctx) {
 TGPDEF void tgp_draw_vertices(tgp_context* ctx, const tgp_vec2* points,
                               uint32_t num_vertices) {
     TINYGP_ASSERT(ctx != NULL);
-    uint32_t    vertex_index = ctx->cur_vertex;
-    tgp_vertex* vtx_write_ptr = tgp_reserve(ctx, num_vertices);
-    if (vtx_write_ptr == NULL || tgp_is_transparent(ctx)) {
+    const uint32_t vtx_offset = ctx->cur_vertex;
+    const uint32_t idx_offset = ctx->cur_index;
+    tgp_vertex*    vtx_write_ptr;
+    tgp_index*     idx_write_ptr;
+    if (!tgp_reserve(ctx, num_vertices, num_vertices * 3, &vtx_write_ptr,
+                     &idx_write_ptr) ||
+        tgp_is_transparent(ctx)) {
         return;
     }
 
@@ -817,7 +855,8 @@ TGPDEF void tgp_draw_vertices(tgp_context* ctx, const tgp_vec2* points,
         vtx_write_ptr[i].position = points[i];
     }
 
-    tgp_queue_draw_transform(ctx, vertex_index, num_vertices, true, true);
+    tgp_queue_draw_transform(ctx, vtx_offset, idx_offset, num_vertices,
+                             num_vertices * 3, true, true);
 }
 
 static inline float tgp_rsqrt(float x) {
@@ -855,30 +894,43 @@ static inline float tgp_rsqrt(float x) {
         }                                                                      \
     } while (false)
 
+// make sure to use the clockwise winding order. the anti-aliasing fringe will
+// not work otherwise.
+// (counter-clockwise shapes will have anti-aliasing "inside" of them)
 TGPDEF void tgp_draw_convex_polygon(tgp_context* ctx, const tgp_vec2* points,
                                     uint32_t num_points) {
     if (num_points < 3 || tgp_is_transparent(ctx)) {
         return;
     }
-    uint32_t vertex_index = ctx->cur_vertex;
+
+    const uint32_t vtx_offset = ctx->cur_vertex;
+    const uint32_t idx_offset = ctx->cur_index;
+    const uint32_t cmd_vtx_offset = ctx->cur_cmd_vertex;
+    // const uint32_t cmd_idx_offset = ctx->cur_cmd_index;
 
     if (ctx->antialiasing) {
         // with antialiasing
         const uint32_t num_vertices = num_points * 2;
-        tgp_vertex*    vtx_write_ptr = tgp_reserve(ctx, num_vertices);
-        if (vtx_write_ptr == NULL) {
+        const uint32_t num_indices = (num_points - 2) * 3 + num_points * 6;
+        tgp_vertex*    vtx_write_ptr;
+        tgp_index*     idx_write_ptr;
+        if (!tgp_reserve(ctx, num_vertices, num_indices, &vtx_write_ptr,
+                         &idx_write_ptr)) {
             return;
         }
         const float     aa_size = ctx->fringe_scale;
         const tgp_color color = ctx->color;
-        const tgp_color color_trans = {0.0f, 0.0f, 0.0f, ctx->color.a};
+        const tgp_color color_trans = {color.r, color.g, color.b, 0.0f};
 
-        // add vertices for the shape
-        // for (uint32_t i = 0; i < num_points; i++) {
-        //     vtx_write_ptr[0].position = points[i];
-        //     vtx_write_ptr[0].color = color;
-        //     vtx_write_ptr++;
-        // }
+        // add indices to fill the shape
+        const uint32_t vtx_inner_idx = cmd_vtx_offset;
+        const uint32_t vtx_outer_idx = cmd_vtx_offset + 1;
+        for (uint32_t i = 2; i < num_points; i++) {
+            idx_write_ptr[0] = vtx_inner_idx;
+            idx_write_ptr[1] = vtx_inner_idx + ((i - 1) << 1);
+            idx_write_ptr[2] = vtx_inner_idx + (i << 1);
+            idx_write_ptr += 3;
+        }
 
         // compute normals
         tgp_vec2 temp_normals[num_points];
@@ -902,27 +954,46 @@ TGPDEF void tgp_draw_convex_polygon(tgp_context* ctx, const tgp_vec2* points,
             dm_y *= aa_size * 0.5f;
 
             // add vertices
-            vtx_write_ptr[0].position.x = points[i1].x - dm_x; // inner
-            vtx_write_ptr[0].position.y = points[i1].y - dm_y; // inner
+            vtx_write_ptr[0].position.x = points[i1].x - dm_x;
+            vtx_write_ptr[0].position.y = points[i1].y - dm_y;
             vtx_write_ptr[0].color = color;
-            vtx_write_ptr[1].position.x = points[i1].x + dm_x; // outer
-            vtx_write_ptr[1].position.y = points[i1].y + dm_y; // outer
+            vtx_write_ptr[1].position.x = points[i1].x + dm_x;
+            vtx_write_ptr[1].position.y = points[i1].y + dm_y;
             vtx_write_ptr[1].color = color_trans;
             vtx_write_ptr += 2;
+
+            // add indices for fringes
+            idx_write_ptr[0] = vtx_inner_idx + (i1 << 1);
+            idx_write_ptr[1] = vtx_inner_idx + (i0 << 1);
+            idx_write_ptr[2] = vtx_outer_idx + (i0 << 1);
+            idx_write_ptr[3] = vtx_outer_idx + (i0 << 1);
+            idx_write_ptr[4] = vtx_outer_idx + (i1 << 1);
+            idx_write_ptr[5] = vtx_inner_idx + (i1 << 1);
+            idx_write_ptr += 6;
         }
-        tgp_queue_draw_transform(ctx, vertex_index, num_vertices, true, false);
+        tgp_queue_draw_transform(ctx, vtx_offset, idx_offset, num_vertices,
+                                 num_indices, true, false);
     } else {
         // without antialiasing
         const uint32_t num_vertices = num_points;
-        tgp_vertex*    vtx_write_ptr = tgp_reserve(ctx, num_vertices);
-        if (vtx_write_ptr == NULL) {
+        const uint32_t num_indices = (num_points - 2) * 3;
+        tgp_vertex*    vtx_write_ptr;
+        tgp_index*     idx_write_ptr;
+        if (!tgp_reserve(ctx, num_vertices, num_indices, &vtx_write_ptr,
+                         &idx_write_ptr)) {
             return;
         }
-
-        for (uint32_t i = 0; i < num_vertices; i++) {
+        for (int i = 0; i < num_vertices; i++) {
             vtx_write_ptr[i].position = points[i];
         }
-        tgp_queue_draw_transform(ctx, vertex_index, num_vertices, true, true);
+        for (int i = 2; i < num_points; i++) {
+            idx_write_ptr[0] = cmd_vtx_offset;
+            idx_write_ptr[1] = cmd_vtx_offset + i - 1;
+            idx_write_ptr[2] = cmd_vtx_offset + i;
+            idx_write_ptr += 3;
+        }
+        tgp_queue_draw_transform(ctx, vtx_offset, idx_offset, num_vertices,
+                                 num_indices, true, true);
     }
 }
 
